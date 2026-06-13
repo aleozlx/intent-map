@@ -53,3 +53,13 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# intent-map build + data artifacts
+/intent-map
+*.db
+*.db-wal
+*.db-shm
+
+# pytest
+.pytest_cache/
+__pycache__/
