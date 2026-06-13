@@ -136,8 +136,10 @@ def test_get_batch_returns_summary_and_detail(run):
     assert code == 0
     recs = imap.parse_records(out)
     assert len(recs) == 2
-    assert (recs[0].fields["summary"], recs[0].fields["detail"]) == ("s1", "d1")
-    assert (recs[1].fields["summary"], recs[1].fields["detail"]) == ("s2", "d2")
+    # summary is on the header, detail in a field; neither value appears twice
+    assert (recs[0].summary, recs[0].fields["detail"]) == ("s1", "d1")
+    assert (recs[1].summary, recs[1].fields["detail"]) == ("s2", "d2")
+    assert "summary" not in recs[0].fields
 
 
 def test_get_missing_label_is_nonzero(run):
@@ -210,7 +212,7 @@ def test_annotate_edits_prose_and_bumps_modified(run):
     before = imap.parse_records(run("get", "L1")[1])[0].fields["modified_at"]
     assert run("annotate", "L1", "--summary", "new", "--detail", "newdetail")[0] == 0
     rec = imap.parse_records(run("get", "L1")[1])[0]
-    assert rec.fields["summary"] == "new"
+    assert rec.summary == "new"
     assert rec.fields["detail"] == "newdetail"
     assert rec.fields["modified_at"] >= before
     # the key binding is untouched
@@ -222,7 +224,7 @@ def test_annotate_one_field_only(run):
     run("allocate", "--summary", "keepme", "--detail", "origdetail")
     run("annotate", "L1", "--detail", "changedonly")
     rec = imap.parse_records(run("get", "L1")[1])[0]
-    assert rec.fields["summary"] == "keepme"
+    assert rec.summary == "keepme"
     assert rec.fields["detail"] == "changedonly"
 
 
@@ -338,13 +340,22 @@ def test_detail_roundtrips_byte_identical(run, detail):
     assert imap.parse_records(out)[0].fields["detail"] == detail
 
 
-@pytest.mark.parametrize("summary", ["one line", "multi\nline\nsummary", "tab\tin\tit", "@:.weird"])
-def test_summary_roundtrips_byte_identical(run, summary):
+@pytest.mark.parametrize("summary", ["one line", "tab\tin\tit", "@:.weird", "ends with dot."])
+def test_single_line_summary_roundtrips_via_header(run, summary):
     code, out, _ = run("allocate", "--summary", summary, "--detail", "d")
     assert code == 0
     label = _label(out)
     rec = imap.parse_records(run("get", label)[1])[0]
-    assert rec.fields["summary"] == summary
+    assert rec.summary == summary          # summary's single home is the header
+    assert "summary" not in rec.fields     # never emitted twice
+
+
+@pytest.mark.parametrize("summary", ["multi\nline", "trailing\n", "\nleading"])
+def test_multiline_summary_rejected(run, summary):
+    # summary is the one-line glance tier; a newline is rejected, not truncated
+    assert run("allocate", "--summary", summary)[0] == 2
+    assert run("allocate", "--summary", "ok")[0] == 0  # the rejection wrote nothing
+    assert run("annotate", "L1", "--summary", summary)[0] == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -454,4 +465,4 @@ def test_db_path_via_flag(tmp_path):
     # round-trips through the same explicit path
     code, out, _ = imap.run("--db", str(db), "get", "L1", db=None)
     assert code == 0
-    assert imap.parse_records(out)[0].fields["summary"] == "flag"
+    assert imap.parse_records(out)[0].summary == "flag"

@@ -104,7 +104,6 @@ Example — `get` on a binding whose `detail` spans multiple lines:
 
 ```
 @L2	world peace plan
-:summary	world peace plan
 :detail	multi
 .line
 .detail
@@ -113,6 +112,9 @@ Example — `get` on a binding whose `detail` spans multiple lines:
 :modified_at	2026-06-13T20:54:16.782Z
 :ordinal	2
 ```
+
+`summary` is the one-line glance tier and lives only on the header line (its
+single home); the fields carry `detail` and metadata. No value is emitted twice.
 
 `tests/imap.py` is the reference reader implementing exactly these three
 regexes.

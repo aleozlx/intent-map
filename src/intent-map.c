@@ -194,6 +194,17 @@ static int label_charset_ok(const char *label)
     return 1;
 }
 
+/* `summary` is the one-line glance tier, carried verbatim on the record header
+ * (its single home), so it must be newline-free; tabs are inert after the
+ * first tab and remain allowed. */
+static int summary_ok(const char *summary)
+{
+    for (const char *p = summary; *p; ++p)
+        if (*p == '\n' || *p == '\r')
+            return 0;
+    return 1;
+}
+
 static int do_allocate(sqlite3 *db, const char *label,
                        const char *summary, const char *detail)
 {
@@ -203,6 +214,10 @@ static int do_allocate(sqlite3 *db, const char *label,
     if (summary == NULL) {
         errf("allocate requires --summary");
         return EX_USAGE;
+    }
+    if (!summary_ok(summary)) {
+        errf("invalid --summary: must be a single line (no newline)");
+        return EX_VALIDATE;
     }
     if (detail == NULL)
         detail = "";
@@ -388,8 +403,9 @@ static int do_get(sqlite3 *db, int n, char **labels)
             const char *retired = (sqlite3_column_type(st, 7) == SQLITE_NULL)
                                       ? NULL
                                       : (const char *)sqlite3_column_text(st, 7);
+            /* summary lives on the header (its single home); the fields
+             * carry detail + metadata. No value is emitted twice. */
             emit_header(label, summary);
-            emit_field("summary", summary);
             emit_field("detail", detail);
             emit_field("status", status);
             emit_field("created_at", created);
@@ -540,6 +556,10 @@ static int do_annotate(sqlite3 *db, const char *label,
         errf("annotate requires --summary and/or --detail");
         return EX_USAGE;
     }
+    if (summary != NULL && !summary_ok(summary)) {
+        errf("invalid --summary: must be a single line (no newline)");
+        return EX_VALIDATE;
+    }
 
     /* Edit prose only and bump modified_at; never touch the key binding. */
     sqlite3_stmt *st = NULL;
@@ -673,9 +693,10 @@ static void print_main_help(void)
 "  prefixed with '.', and the producer never emits a bare value line. Given\n"
 "  this, value prose may contain ANY character (@, :, ., tab, newline) with\n"
 "  zero character-level escaping — newlines are re-wrapped, not escaped.\n"
-"  Field keys for `get`: summary, detail, status, created_at, modified_at,\n"
-"  ordinal, retired_at. `index` emits ':'<keyword>TAB<count>. `recent` appends\n"
-"  TAB<modified_at> to each header line.\n",
+"  `get` carries summary on the record header (its single home); its field\n"
+"  keys are detail, status, created_at, modified_at, ordinal, retired_at.\n"
+"  `index` emits ':'<keyword>TAB<count>. `recent` appends TAB<modified_at> to\n"
+"  each header line.\n",
         stdout);
 }
 
@@ -689,7 +710,9 @@ static void print_verb_help(const char *verb)
 "  Caller-supplied (--label KEY): validates charset (non-empty, no tab/newline)\n"
 "    and uniqueness vs. active AND retired keys; rejects (nonzero, no write) on\n"
 "    violation and never coerces. Re-using a retired key is forbidden.\n"
-"  Prints: @<label>TAB<summary>. Exit: 0 ok, 1 usage, 2 invalid label,\n"
+"  --summary is the one-line glance (no newline); --detail is free-form,\n"
+"    multi-line prose.\n"
+"  Prints: @<label>TAB<summary>. Exit: 0 ok, 1 usage, 2 invalid arg,\n"
 "    3 conflict, 5 db.\n", stdout);
     } else if (strcmp(verb, "search") == 0) {
         fputs(
@@ -702,9 +725,9 @@ static void print_verb_help(const char *verb)
         fputs(
 "intent-map get LABEL [LABEL ...]\n"
 "  Exact fetch by key (any status, including retired). Prints one record per\n"
-"  found label: a header line plus fields summary, detail, status, created_at,\n"
-"  modified_at, ordinal, and retired_at (only if retired). Exit 4 if any\n"
-"  requested label does not exist.\n", stdout);
+"  found label: a header line (label + summary) plus fields detail, status,\n"
+"  created_at, modified_at, ordinal, and retired_at (only if retired). Exit 4\n"
+"  if any requested label does not exist.\n", stdout);
     } else if (strcmp(verb, "index") == 0) {
         fputs(
 "intent-map index [--with-labels]\n"
