@@ -155,6 +155,23 @@ static const char *SCHEMA_SQL =
     "CREATE VIRTUAL TABLE IF NOT EXISTS bindings_vocab"
     "  USING fts5vocab('bindings_fts','instance');";
 
+/* Run `sql`, retrying on transient SQLITE_BUSY/SQLITE_LOCKED. Used for the
+ * idempotent schema bootstrap, which several processes may run simultaneously
+ * the first time a shared db is created — the `PRAGMA journal_mode=WAL` switch
+ * in particular can report BUSY without invoking the busy handler. Every
+ * statement is IF-NOT-EXISTS / idempotent, so re-running is safe. */
+static int exec_retry(sqlite3 *db, const char *sql)
+{
+    int rc = SQLITE_OK;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED)
+            return rc;
+        sqlite3_sleep(10); /* ms */
+    }
+    return rc;
+}
+
 static sqlite3 *open_db(const char *path)
 {
     sqlite3 *db = NULL;
@@ -168,12 +185,10 @@ static sqlite3 *open_db(const char *path)
     /* Wait rather than fail when another process holds the write lock. */
     sqlite3_busy_timeout(db, 10000);
 
-    char *err = NULL;
-    rc = sqlite3_exec(db, SCHEMA_SQL, NULL, NULL, &err);
+    rc = exec_retry(db, SCHEMA_SQL);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "intent-map: schema init failed: %s\n",
-                err ? err : sqlite3_errmsg(db));
-        sqlite3_free(err);
+                sqlite3_errmsg(db));
         sqlite3_close(db);
         return NULL;
     }
