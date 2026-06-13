@@ -1,5 +1,7 @@
 # intent-map
 
+[![CI](https://github.com/aleozlx/intent-map/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aleozlx/intent-map/actions/workflows/ci.yml)
+
 An agent-friendly, symbol-oriented binding store: a single executable wrapping
 a SQLite (WAL) store that maps stable opaque **keys** (`label`s) to their
 **meaning** — a one-line `summary` (glance tier) plus durable free-form
