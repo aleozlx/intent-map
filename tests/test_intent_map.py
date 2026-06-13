@@ -437,7 +437,7 @@ def test_never_reuse_across_deletes(run, db):
 def test_help_documents_verbs_codes_and_grammar(run):
     code, out, _ = run("--help")
     assert code == 0
-    for verb in ("allocate", "search", "get", "index", "recent", "annotate", "retire"):
+    for verb in ("allocate", "search", "get", "index", "recent", "annotate", "retire", "view"):
         assert verb in out
     for ec in ("0", "1", "2", "3", "4", "5"):
         assert ec in out
@@ -451,7 +451,7 @@ def test_help_documents_verbs_codes_and_grammar(run):
 
 
 def test_per_verb_help(run):
-    for verb in ("allocate", "search", "get", "index", "recent", "annotate", "retire"):
+    for verb in ("allocate", "search", "get", "index", "recent", "annotate", "retire", "view"):
         code, out, _ = run(verb, "--help")
         assert code == 0
         assert verb in out
@@ -466,3 +466,106 @@ def test_db_path_via_flag(tmp_path):
     code, out, _ = imap.run("--db", str(db), "get", "L1", db=None)
     assert code == 0
     assert imap.parse_records(out)[0].summary == "flag"
+
+
+# --------------------------------------------------------------------------- #
+# view — source overlay (presentation, filename:symbol convention)            #
+# --------------------------------------------------------------------------- #
+
+def _block_above(lines, label_line):
+    """The contiguous run of ';' comment lines immediately above label_line."""
+    idx = lines.index(label_line)
+    j = idx - 1
+    blk = []
+    while j >= 0 and lines[j].lstrip().startswith(";"):
+        blk.append(lines[j])
+        j -= 1
+    return list(reversed(blk))
+
+
+def test_view_injects_intent_before_label(run, tmp_path):
+    src = tmp_path / "demo.s"
+    src.write_text("section .text\n_start:\n    mov rax, 1\narg_table:\n    dq 0\n")
+    f = str(src)
+    run("allocate", "--label", f"{f}:_start", "--summary", "program entry point", "--detail", "sets up the stack")
+    run("allocate", "--label", f"{f}:arg_table", "--summary", "flag handler table", "--detail", "maps flag to offset")
+    code, out, _ = run("view", f, "--stdout")
+    assert code == 0
+    lines = out.split("\n")
+    # comment block sits immediately above each label, summary+detail present
+    blk1 = _block_above(lines, "_start:")
+    assert blk1 and "program entry point" in "\n".join(blk1)
+    assert "sets up the stack" in "\n".join(blk1)
+    blk2 = _block_above(lines, "arg_table:")
+    assert "flag handler table" in "\n".join(blk2)
+    # original source content is preserved in order
+    assert "    mov rax, 1" in lines and "    dq 0" in lines
+
+
+def test_view_matches_label_indentation(run, tmp_path):
+    src = tmp_path / "f.asm"
+    src.write_text("    indented_label:\n        nop\n")
+    f = str(src)
+    run("allocate", "--label", f"{f}:indented_label", "--summary", "s", "--detail", "d")
+    out = run("view", f, "--stdout")[1]
+    blk = _block_above(out.split("\n"), "    indented_label:")
+    assert blk
+    assert all(line.startswith("    ;") for line in blk)  # indent preserved
+
+
+def test_view_wraps_at_80_columns(run, tmp_path):
+    src = tmp_path / "f.asm"
+    src.write_text("sym:\n")
+    f = str(src)
+    long_detail = " ".join(f"word{i}" for i in range(80))
+    run("allocate", "--label", f"{f}:sym", "--summary", "short", "--detail", long_detail)
+    out = run("view", f, "--stdout")[1]
+    comment_lines = [l for l in out.split("\n") if l.lstrip().startswith(";")]
+    assert comment_lines
+    assert all(len(l) <= 80 for l in comment_lines)  # nothing exceeds 80 cols
+    assert len(comment_lines) > 3                     # actually wrapped
+
+
+def test_view_only_exact_filename_match(run, tmp_path):
+    src = tmp_path / "a.asm"
+    src.write_text("foo:\n")
+    f = str(src)
+    run("allocate", "--label", "other.asm:foo", "--summary", "wrong file", "--detail", "x")
+    code, out, err = run("view", f, "--stdout")
+    assert code == 0
+    assert "wrong file" not in out
+    assert "no active entries" in err
+
+
+def test_view_skips_and_reports_unplaced_symbols(run, tmp_path):
+    src = tmp_path / "a.asm"
+    src.write_text("present:\n")
+    f = str(src)
+    run("allocate", "--label", f"{f}:present", "--summary", "here", "--detail", "d")
+    run("allocate", "--label", f"{f}:absent", "--summary", "nowhere", "--detail", "d")
+    code, out, err = run("view", f, "--stdout")
+    assert code == 0
+    assert "here" in out and "nowhere" not in out
+    assert "1/2" in err
+
+
+def test_view_file_level_note_at_top(run, tmp_path):
+    src = tmp_path / "notes.txt"
+    src.write_text("hello world\n")
+    f = str(src)
+    run("allocate", "--label", f, "--summary", "file overview", "--detail", "top-level note")
+    out = run("view", f, "--stdout")[1]
+    lines = out.split("\n")
+    assert lines[0].lstrip().startswith(";")
+    assert "file overview" in out and "hello world" in out
+
+
+def test_view_requires_exactly_one_file(run, tmp_path):
+    src = tmp_path / "a.asm"
+    src.write_text("x:\n")
+    assert run("view")[0] == 1                       # zero files
+    assert run("view", str(src), "extra")[0] == 1    # two files
+
+
+def test_view_missing_file_is_nonzero(run):
+    assert run("view", "/no/such/file.asm", "--stdout")[0] == 4

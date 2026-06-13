@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* ---- exit codes (documented in --help; callers switch on these) ---------- */
 enum {
@@ -635,6 +637,272 @@ static int do_retire(sqlite3 *db, const char *label)
 }
 
 /* ========================================================================= */
+/* Verb: view (human presentation overlay; NOT the §5.1 grammar)             */
+/* ========================================================================= */
+
+#define VIEW_COL 80  /* fixed wrap width (not configurable, for simplicity)  */
+
+/* Greedily word-wrap one logical line of `text` into `indent`-prefixed
+ * "<indent>; word word ..." comment lines, each at most VIEW_COL columns. */
+static void emit_wrapped(FILE *out, const char *indent, const char *text)
+{
+    int avail = VIEW_COL - (int)strlen(indent) - 2; /* "; " occupies 2 cols */
+    if (avail < 1)
+        avail = 1;
+    const char *p = text;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    int col = 0, have = 0;
+    while (*p) {
+        const char *w = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        int wl = (int)(p - w);
+        if (!have) {
+            fprintf(out, "%s; ", indent);
+            fwrite(w, 1, (size_t)wl, out);
+            col = wl;
+            have = 1;
+        } else if (col + 1 + wl <= avail) {
+            fputc(' ', out);
+            fwrite(w, 1, (size_t)wl, out);
+            col += 1 + wl;
+        } else {
+            fprintf(out, "\n%s; ", indent);
+            fwrite(w, 1, (size_t)wl, out);
+            col = wl;
+        }
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+    if (have)
+        fputc('\n', out);
+}
+
+static int line_is_blank(const char *s)
+{
+    for (; *s; ++s)
+        if (*s != ' ' && *s != '\t' && *s != '\r')
+            return 0;
+    return 1;
+}
+
+/* Emit the injected intent block: summary, then (if any) detail, each
+ * word-wrapped to VIEW_COL, every physical line prefixed "<indent>; ". */
+static void emit_comment_block(FILE *out, const char *indent,
+                               const char *summary, const char *detail)
+{
+    emit_wrapped(out, indent, summary);
+    if (detail && *detail) {
+        fprintf(out, "%s;\n", indent); /* blank divider line */
+        const char *p = detail;
+        for (;;) {
+            const char *nl = strchr(p, '\n');
+            size_t len = nl ? (size_t)(nl - p) : strlen(p);
+            char *line = strndup(p, len);
+            if (line_is_blank(line)) {
+                fprintf(out, "%s;\n", indent);
+            } else {
+                size_t L = strlen(line);
+                if (L && line[L - 1] == '\r')
+                    line[L - 1] = '\0';
+                emit_wrapped(out, indent, line);
+            }
+            free(line);
+            if (!nl)
+                break;
+            p = nl + 1;
+        }
+    }
+}
+
+struct binding_note {
+    char *symbol;  /* NULL for a file-level (qualifier-only) note */
+    char *summary;
+    char *detail;
+    int injected;
+};
+
+/*
+ * view FILE: overlay active intent onto one source file.
+ *
+ * Convention (agent-invented; documented in --help): a label is "<file>:<sym>"
+ * — the text before the FIRST ':' is the file, the rest is the in-file symbol.
+ * Only bindings whose file part matches FILE exactly are processed; for each,
+ * the summary+detail are injected as '<indent>;'-prefixed comments (wrapped to
+ * VIEW_COL) immediately above the first line matching ^\s*<sym>: , regardless
+ * of the source language. A label equal to FILE (no ':') is a file-level note
+ * shown at the top.
+ */
+static int do_view(sqlite3 *db, const char *file, int force_stdout)
+{
+    if (file == NULL) {
+        errf("view requires exactly one FILE");
+        return EX_USAGE;
+    }
+
+    FILE *f = fopen(file, "rb");
+    if (!f) {
+        fprintf(stderr, "intent-map: cannot open file: %s\n", file);
+        return EX_NOTFOUND;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz < 0)
+        sz = 0;
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        errf("out of memory");
+        return EX_DB;
+    }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    struct binding_note *notes = NULL;
+    int nnotes = 0, ncap = 0;
+    size_t flen = strlen(file);
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT label,summary,detail FROM bindings WHERE status='active'"
+        " ORDER BY ordinal;", -1, &st, NULL);
+    if (rc != SQLITE_OK) {
+        errf(sqlite3_errmsg(db));
+        free(buf);
+        return EX_DB;
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *label   = (const char *)sqlite3_column_text(st, 0);
+        const char *summary = (const char *)sqlite3_column_text(st, 1);
+        const char *detail  = (const char *)sqlite3_column_text(st, 2);
+        const char *colon = strchr(label, ':');
+        char *sym;
+        if (colon) {
+            size_t qlen = (size_t)(colon - label);
+            if (qlen != flen || strncmp(label, file, qlen) != 0)
+                continue;            /* file part doesn't match exactly */
+            sym = strdup(colon + 1); /* the in-file symbol */
+        } else {
+            if (strcmp(label, file) != 0)
+                continue;            /* not a file-level note for FILE */
+            sym = NULL;
+        }
+        if (nnotes == ncap) {
+            ncap = ncap ? ncap * 2 : 8;
+            notes = realloc(notes, (size_t)ncap * sizeof *notes);
+        }
+        notes[nnotes].symbol  = sym;
+        notes[nnotes].summary = strdup(summary);
+        notes[nnotes].detail  = strdup(detail);
+        notes[nnotes].injected = 0;
+        nnotes++;
+    }
+    sqlite3_finalize(st);
+
+    /* Destination: stdout when forced or non-interactive; otherwise a temp
+     * file handed to $INTENT_MAP_VIEWER (default "view"), named after FILE so
+     * the viewer keeps syntax highlighting. */
+    int launch = (!force_stdout && isatty(STDOUT_FILENO));
+    char dir[] = "/tmp/intent-map-XXXXXX";
+    char path[4096];
+    FILE *out = stdout;
+    if (launch) {
+        if (!mkdtemp(dir)) {
+            launch = 0;
+        } else {
+            const char *base = strrchr(file, '/');
+            base = base ? base + 1 : file;
+            snprintf(path, sizeof path, "%s/%s", dir, base);
+            out = fopen(path, "w");
+            if (!out) {
+                rmdir(dir);
+                out = stdout;
+                launch = 0;
+            }
+        }
+    }
+
+    /* File-level notes first, at the very top. */
+    for (int i = 0; i < nnotes; ++i) {
+        if (notes[i].symbol == NULL) {
+            emit_comment_block(out, "", notes[i].summary, notes[i].detail);
+            fputc('\n', out);
+            notes[i].injected = 1;
+        }
+    }
+
+    /* Walk the source; inject above the first line matching ^\s*<symbol>: . */
+    size_t i = 0;
+    while (i < n) {
+        size_t start = i;
+        while (i < n && buf[i] != '\n')
+            i++;
+        size_t le = i;                      /* line content end (excl '\n') */
+        size_t end = (i < n) ? i + 1 : i;   /* incl '\n' if present */
+        size_t ws = start;
+        while (ws < le && (buf[ws] == ' ' || buf[ws] == '\t'))
+            ws++;
+        for (int k = 0; k < nnotes; ++k) {
+            if (notes[k].injected || notes[k].symbol == NULL)
+                continue;
+            size_t slen = strlen(notes[k].symbol);
+            if (ws + slen < le &&
+                memcmp(buf + ws, notes[k].symbol, slen) == 0 &&
+                buf[ws + slen] == ':') {
+                char *indent = strndup(buf + start, ws - start);
+                emit_comment_block(out, indent, notes[k].summary,
+                                   notes[k].detail);
+                free(indent);
+                notes[k].injected = 1;
+                break; /* labels are unique, so at most one per line */
+            }
+        }
+        fwrite(buf + start, 1, end - start, out);
+        i = end;
+    }
+
+    int unplaced = 0;
+    for (int k = 0; k < nnotes; ++k)
+        if (!notes[k].injected)
+            unplaced++;
+    if (nnotes == 0)
+        fprintf(stderr, "intent-map: no active entries for '%s'\n", file);
+    else if (unplaced)
+        fprintf(stderr,
+                "intent-map: %d/%d entries had no matching label in %s\n",
+                unplaced, nnotes, file);
+
+    for (int k = 0; k < nnotes; ++k) {
+        free(notes[k].symbol);
+        free(notes[k].summary);
+        free(notes[k].detail);
+    }
+    free(notes);
+    free(buf);
+
+    if (launch) {
+        fclose(out);
+        const char *viewer = getenv("INTENT_MAP_VIEWER");
+        if (!viewer || !*viewer)
+            viewer = "view";
+        pid_t pid = fork();
+        if (pid == 0) {
+            execlp(viewer, viewer, path, (char *)NULL);
+            _exit(127);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+        unlink(path);
+        rmdir(dir);
+    }
+    return EX_OK;
+}
+
+/* ========================================================================= */
 /* Help / discoverability (§5 + §5.1)                                        */
 /* ========================================================================= */
 
@@ -672,6 +940,11 @@ static void print_main_help(void)
 "  retire LABEL\n"
 "        Soft-delete (tombstone). Keeps the row and burns the key forever.\n"
 "        There is no hard delete and no key remap, by design.\n"
+"  view FILE [--stdout]\n"
+"        Human overlay: inject active intent as ';' comments (summary+detail,\n"
+"        wrapped to 80 cols) above the label each binding annotates, then open\n"
+"        in $INTENT_MAP_VIEWER (default 'view'). Labels are '<file>:<symbol>';\n"
+"        only an exact file match is shown. See `view --help`.\n"
 "\n"
 "DATABASE\n"
 "  Path resolves to: --db PATH, else $INTENT_MAP_DB, else ./intent-map.db.\n"
@@ -696,7 +969,8 @@ static void print_main_help(void)
 "  `get` carries summary on the record header (its single home); its field\n"
 "  keys are detail, status, created_at, modified_at, ordinal, retired_at.\n"
 "  `index` emits ':'<keyword>TAB<count>. `recent` appends TAB<modified_at> to\n"
-"  each header line.\n",
+"  each header line. (`view` is exempt: it emits annotated source text, not\n"
+"  this grammar.)\n",
         stdout);
 }
 
@@ -752,6 +1026,24 @@ static void print_verb_help(const char *verb)
 "  Soft-delete: sets status=retired, stamps retired_at, keeps the row, keeps\n"
 "  the key burned forever. The only form of deletion; idempotent. Exit 4 if no\n"
 "  such label.\n", stdout);
+    } else if (strcmp(verb, "view") == 0) {
+        fputs(
+"intent-map view FILE [--stdout]\n"
+"  Human presentation overlay (NOT the §5.1 grammar): render one source file\n"
+"  with its active intent injected as assembly-style ';' comments.\n"
+"  Label convention: a label '<file>:<symbol>' binds <symbol> within <file>;\n"
+"    the text before the FIRST ':' must match FILE exactly. A label equal to\n"
+"    FILE (no ':') is a file-level note shown at the top. Other entries are\n"
+"    ignored.\n"
+"  For each match, the binding's summary and detail (word-wrapped to 80\n"
+"    columns) are emitted as ';'-prefixed lines, indented to match and placed\n"
+"    immediately above the first line matching ^\\s*<symbol>: , regardless of\n"
+"    the source language. Entries with no matching label are skipped and\n"
+"    counted on stderr.\n"
+"  Output: stdout when --stdout is given or stdout is not a terminal;\n"
+"    otherwise opened in $INTENT_MAP_VIEWER (default 'view').\n"
+"  Exit: 0 ok, 1 usage (needs exactly one FILE), 4 if FILE cannot be opened.\n",
+            stdout);
     } else {
         print_main_help();
     }
@@ -887,6 +1179,16 @@ int main(int argc, char **argv)
     } else if (strcmp(verb, "retire") == 0) {
         const char *label = (n >= 2) ? a[1] : NULL;
         rc = do_retire(db, label);
+    } else if (strcmp(verb, "view") == 0) {
+        const char *file = NULL;
+        int force_stdout = 0;
+        for (int i = 1; i < n; ++i) {
+            if (strcmp(a[i], "--stdout") == 0)        force_stdout = 1;
+            else if (a[i][0] != '-' && file == NULL)  file = a[i];
+            else { fprintf(stderr, "intent-map: unknown view arg: %s\n", a[i]);
+                   sqlite3_close(db); return EX_USAGE; }
+        }
+        rc = do_view(db, file, force_stdout);
     } else {
         fprintf(stderr, "intent-map: unknown verb: %s\n", verb);
         print_main_help();

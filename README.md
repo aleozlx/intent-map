@@ -45,6 +45,7 @@ intent-map index [--with-labels]
 intent-map recent [--limit N]
 intent-map annotate LABEL [--summary STR] [--detail STR]
 intent-map retire LABEL
+intent-map view FILE [--stdout]
 ```
 
 - **`allocate`** — create a binding atomically. *Minted* (no `--label`) hands
@@ -65,6 +66,19 @@ intent-map retire LABEL
 - **`retire`** — soft-delete (tombstone): keeps the row, keeps the key burned
   forever, removes it from discovery. The *only* form of deletion; there is no
   hard delete and no key remap, by design (see §6 of the design doc).
+- **`view`** — a human presentation overlay (not the wire grammar): renders one
+  source file with its active intent injected as assembly-style `;` comments.
+  It follows the optional caller convention that a label is `<file>:<symbol>` —
+  the text before the first `:` is the file, the rest is the in-file symbol.
+  Only bindings whose file part matches `FILE` **exactly** are shown; for each,
+  the summary + detail (word-wrapped to 80 columns, indentation matched) are
+  injected immediately above the first line matching `^\s*<symbol>:`, regardless
+  of source language. A label equal to `FILE` (no `:`) is a file-level note
+  shown at the top; entries with no matching label are skipped (counted on
+  stderr). Prints to stdout with `--stdout` or when stdout is not a terminal;
+  otherwise opens `$INTENT_MAP_VIEWER` (default `view`). The `<file>:<symbol>`
+  scheme is a *caller* convention `view` interprets — the core store stays
+  symbol-agnostic.
 
 `intent-map --help` and `intent-map VERB --help` are the complete
 discoverability layer — including the exit codes and the wire grammar below.
@@ -133,3 +147,27 @@ $ intent-map search coolant
 @L1	thermal regulator
 $ intent-map retire L1          # tombstone; key L1 stays burned forever
 ```
+
+Overlaying intent onto a source file with `view` (labels `demo.s:_start`,
+`demo.s:arg_table`):
+
+```sh
+$ intent-map view demo.s --stdout
+section .text
+global _start
+
+; program entry point: set up the stack, then jump to the run loop
+;
+; Exits with status 0 once the run loop returns.
+_start:
+    mov rax, 1
+    syscall
+
+; argument table: maps each flag byte to its handler offset
+;
+; A zero entry marks an unhandled flag.
+arg_table:
+    dq 0
+```
+
+Drop `--stdout` to open the annotated file directly in `view` (the TUI).
